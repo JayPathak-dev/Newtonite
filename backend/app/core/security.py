@@ -36,6 +36,22 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
+import secrets
+import hmac
+
+
+def generate_csrf_token() -> str:
+    """Generate a secure cryptographically random CSRF token."""
+    return secrets.token_hex(32)
+
+
+def validate_csrf_tokens(cookie_token: Optional[str], header_token: Optional[str]) -> bool:
+    """Validate CSRF token using constant-time comparison."""
+    if not cookie_token or not header_token:
+        return False
+    return hmac.compare_digest(cookie_token, header_token)
+
+
 def decode_access_token(token: str) -> Optional[dict]:
     """Decode and validate a JWT token. Returns payload or None."""
     try:
@@ -43,3 +59,4 @@ def decode_access_token(token: str) -> Optional[dict]:
         return payload
     except JWTError:
         return None
+

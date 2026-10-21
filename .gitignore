@@ -28,15 +28,18 @@ env/
 node_modules/
 dist/
 .npm
+.vite/
 
-# Secrets and environment
+# Secrets and environment files
 .env
-.env.local
-.env.*.local
+.env.*
+*.env
+backend/.env
+frontend/.env*
 *.pem
 *.key
 
-# Test coverage
+# Test coverage & caches
 .coverage
 htmlcov/
 .pytest_cache/
@@ -53,15 +56,14 @@ coverage.xml
 # OS
 .DS_Store
 Thumbs.db
+__MACOSX
 
 # Logs
 *.log
 logs/
 
-# Alembic versions not needed in gitignore - track them
-# But exclude auto-generated dev migration backups
-*.pyc
-
-# Build artifacts
+# Build and submission archives
+*.tar.gz
+*.zip
 frontend/dist/
-frontend/.vite/
+

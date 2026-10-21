@@ -32,6 +32,63 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def csrf_protection_middleware(request: Request, call_next):
+    """
+    CSRF protection for state-changing HTTP requests.
+    Validates Origin/Referer headers and double-submit CSRF cookie/header
+    whenever an authenticated session cookie is present.
+    """
+    # Safe methods do not require CSRF token
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return await call_next(request)
+
+    path = request.url.path
+
+    # Public unauthenticated endpoints exempted from CSRF token check
+    if path in ("/api/v1/auth/login", "/health/live", "/health/ready"):
+        return await call_next(request)
+
+    # Origin header verification
+    origin = request.headers.get("origin")
+    if origin and settings.cors_origins_list:
+        if origin not in settings.cors_origins_list and origin != f"http://{request.url.netloc}":
+            logger.warning(f"Rejected request from untrusted origin: {origin}")
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "code": "FORBIDDEN_ORIGIN",
+                        "message": "Request origin is not allowed",
+                        "details": {"origin": origin},
+                    }
+                },
+            )
+
+    # If authenticated via HttpOnly cookie, enforce double-submit CSRF token
+    has_auth_cookie = "access_token" in request.cookies
+    if has_auth_cookie:
+        from app.core.security import validate_csrf_tokens
+        cookie_csrf = request.cookies.get("csrf_token")
+        header_csrf = request.headers.get("X-CSRF-Token") or request.headers.get("x-csrf-token")
+
+        if not validate_csrf_tokens(cookie_csrf, header_csrf):
+            logger.warning(f"CSRF validation failed for {request.method} {path}")
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "code": "CSRF_ERROR",
+                        "message": "CSRF validation failed: missing or invalid X-CSRF-Token header",
+                        "details": {},
+                    }
+                },
+            )
+
+    return await call_next(request)
+
+
+
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
     return JSONResponse(

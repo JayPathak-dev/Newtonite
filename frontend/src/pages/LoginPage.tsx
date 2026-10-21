@@ -1,23 +1,30 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Layers, ShieldCheck, Lock, Mail, ArrowRight, AlertCircle } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+
 
 export const LoginPage: React.FC = () => {
   const { login, user } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
 
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('Password123!');
+  const queryParams = new URLSearchParams(location.search);
+  const initialEmail = queryParams.get('email') || '';
+
+  const [email, setEmail] = useState(initialEmail);
+  const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   // If already logged in, redirect
-  if (user) {
-    const from = (location.state as any)?.from?.pathname || '/dashboard';
-    navigate(from, { replace: true });
-  }
+  useEffect(() => {
+    if (user) {
+      const from = (location.state as any)?.from?.pathname || '/dashboard';
+      navigate(from, { replace: true });
+    }
+  }, [user, navigate, location]);
+
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -36,9 +43,13 @@ export const LoginPage: React.FC = () => {
 
   const fillCredentials = (userEmail: string) => {
     setEmail(userEmail);
-    setPassword('Password123!');
+    // In dev environment only, fill the standard seed password
+    if (import.meta.env.DEV) {
+      setPassword('Password123!');
+    }
     setError(null);
   };
+
 
   const demoPresets = [
     {
@@ -166,35 +177,38 @@ export const LoginPage: React.FC = () => {
             </button>
           </form>
 
-          {/* Quick Demo Credentials Switcher */}
-          <div className="mt-6 pt-6 border-t border-border">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-text-primary mb-2.5">
-              <ShieldCheck className="w-4 h-4 text-primary" />
-              <span>Assessment Demo Accounts</span>
-            </div>
-            <p className="text-[11px] text-text-secondary mb-3 leading-relaxed">
-              Click any demo persona to automatically fill credentials:
-            </p>
+          {/* Quick Demo Credentials Switcher - Development Only */}
+          {import.meta.env.DEV && (
+            <div className="mt-6 pt-6 border-t border-border">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-text-primary mb-2.5">
+                <ShieldCheck className="w-4 h-4 text-primary" />
+                <span>Dev Demo Accounts (Assessment Testing)</span>
+              </div>
+              <p className="text-[11px] text-text-secondary mb-3 leading-relaxed">
+                Click any demo persona to populate login fields for assessment testing:
+              </p>
 
-            <div className="grid grid-cols-2 gap-2">
-              {demoPresets.map((preset) => (
-                <button
-                  key={preset.email}
-                  type="button"
-                  onClick={() => fillCredentials(preset.email)}
-                  className={`p-2 rounded-lg border text-left transition-all ${preset.color}`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-text-primary">{preset.name}</span>
-                  </div>
-                  <span className={`inline-block text-[10px] px-1.5 py-0.2 rounded font-medium mt-1 ${preset.badge}`}>
-                    {preset.role}
-                  </span>
-                </button>
-              ))}
+              <div className="grid grid-cols-2 gap-2">
+                {demoPresets.map((preset) => (
+                  <button
+                    key={preset.email}
+                    type="button"
+                    onClick={() => fillCredentials(preset.email)}
+                    className={`p-2 rounded-lg border text-left transition-all ${preset.color}`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-text-primary">{preset.name}</span>
+                    </div>
+                    <span className={`inline-block text-[10px] px-1.5 py-0.2 rounded font-medium mt-1 ${preset.badge}`}>
+                      {preset.role}
+                    </span>
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
+
       </div>
     </div>
   );

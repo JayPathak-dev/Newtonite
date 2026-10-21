@@ -11,14 +11,16 @@ logger = logging.getLogger(__name__)
 def authenticate_user(db: Session, email: str, password: str) -> User:
     """Authenticate user by email and password. Returns User or raises UnauthorizedError."""
     user = db.query(User).filter(
-        User.email == email.lower().strip(),
-        User.is_active == True,
+        User.email == email.lower().strip()
     ).first()
     
     if not user:
-        # Use constant-time response to prevent user enumeration via timing
         logger.warning(f"Login attempt for unknown email: {email}")
         raise UnauthorizedError("Invalid email or password")
+
+    if not user.is_active:
+        logger.warning(f"Login attempt for inactive user: {user.id}")
+        raise UnauthorizedError("User account is inactive")
     
     if not verify_password(password, user.password_hash):
         logger.warning(f"Failed login attempt for user: {user.id}")

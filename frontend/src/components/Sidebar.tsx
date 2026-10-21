@@ -25,26 +25,18 @@ const DEMO_ACCOUNTS = [
 ];
 
 export const Sidebar: React.FC = () => {
-  const { user, logout, quickSwitchUser } = useAuth();
+  const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [showDemoSwitcher, setShowDemoSwitcher] = useState(false);
-  const [switching, setSwitching] = useState(false);
 
   const handleLogout = async () => {
     await logout();
     navigate('/login');
   };
 
-  const handleQuickSwitch = async (email: string) => {
-    setSwitching(true);
-    try {
-      await quickSwitchUser(email);
-      setShowDemoSwitcher(false);
-      // Reload current page or navigate to dashboard to reflect permission changes
-      navigate('/dashboard');
-    } finally {
-      setSwitching(false);
-    }
+  const handleSwitchToUser = async (email: string) => {
+    await logout();
+    navigate(`/login?email=${encodeURIComponent(email)}`);
   };
 
   const navItems = [
@@ -72,53 +64,53 @@ export const Sidebar: React.FC = () => {
         </div>
       </div>
 
-      {/* Quick Demo Switcher Banner */}
-      <div className="px-3 pt-3">
-        <div className="bg-primary-light border border-indigo-200 rounded-lg p-2.5">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-primary">
-              <Shield className="w-3.5 h-3.5" />
-              <span>Demo Role Switcher</span>
+      {/* Development Account Switcher (Links to login) */}
+      {import.meta.env.DEV && (
+        <div className="px-3 pt-3">
+          <div className="bg-primary-light border border-indigo-200 rounded-lg p-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-primary">
+                <Shield className="w-3.5 h-3.5" />
+                <span>Dev Account Switcher</span>
+              </div>
+              <button
+                onClick={() => setShowDemoSwitcher(!showDemoSwitcher)}
+                className="text-xs text-primary hover:text-primary-hover font-medium flex items-center gap-0.5"
+              >
+                Switch <ChevronDown className={`w-3 h-3 transition-transform ${showDemoSwitcher ? 'rotate-180' : ''}`} />
+              </button>
             </div>
-            <button
-              onClick={() => setShowDemoSwitcher(!showDemoSwitcher)}
-              className="text-xs text-primary hover:text-primary-hover font-medium flex items-center gap-0.5"
-            >
-              Switch <ChevronDown className={`w-3 h-3 transition-transform ${showDemoSwitcher ? 'rotate-180' : ''}`} />
-            </button>
-          </div>
 
-          {showDemoSwitcher && (
-            <div className="mt-2.5 pt-2 border-t border-indigo-200/60 space-y-1">
-              {DEMO_ACCOUNTS.map((acc) => {
-                const isActive = user?.email === acc.email;
-                return (
-                  <button
-                    key={acc.email}
-                    onClick={() => handleQuickSwitch(acc.email)}
-                    disabled={switching}
-                    className={`w-full text-left px-2 py-1.5 rounded text-xs transition-colors flex items-center justify-between ${
-                      isActive
-                        ? 'bg-primary text-white font-semibold'
-                        : 'text-text-primary hover:bg-white'
-                    }`}
-                  >
-                    <span className="truncate">{acc.name}</span>
-                    <span
-                      className={`text-[10px] px-1.5 py-0.2 rounded font-medium ${
-                        isActive ? 'bg-white/20 text-white' : 'bg-gray-100 text-text-secondary'
+            {showDemoSwitcher && (
+              <div className="mt-2.5 pt-2 border-t border-indigo-200/60 space-y-1">
+                {DEMO_ACCOUNTS.map((acc) => {
+                  const isActive = user?.email === acc.email;
+                  return (
+                    <button
+                      key={acc.email}
+                      onClick={() => handleSwitchToUser(acc.email)}
+                      className={`w-full text-left px-2 py-1.5 rounded text-xs transition-colors flex items-center justify-between ${
+                        isActive
+                          ? 'bg-primary text-white font-semibold'
+                          : 'text-text-primary hover:bg-white'
                       }`}
                     >
-                      {acc.badge}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
+                      <span className="truncate">{acc.name}</span>
+                      <span
+                        className={`text-[10px] px-1.5 py-0.2 rounded font-medium ${
+                          isActive ? 'bg-white/20 text-white' : 'bg-gray-100 text-text-secondary'
+                        }`}
+                      >
+                        {acc.badge}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
-
+      )}
       {/* Navigation */}
       <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
         {navItems.map((item) => {

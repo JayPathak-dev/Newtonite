@@ -1,13 +1,12 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { CurrentUser } from '../types';
-import { api, tokenStorage } from '../lib/api';
+import { api } from '../lib/api';
 
 interface AuthContextType {
   user: CurrentUser | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
-  quickSwitchUser: (email: string) => Promise<void>;
   refreshUser: () => Promise<void>;
 }
 
@@ -23,7 +22,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setUser(currentUser);
     } catch {
       setUser(null);
-      tokenStorage.clear();
     } finally {
       setLoading(false);
     }
@@ -47,19 +45,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       await api.auth.logout();
     } catch {
-      // ignore
+      // ignore network errors on logout
     } finally {
       setUser(null);
-    }
-  };
-
-  const quickSwitchUser = async (email: string) => {
-    setLoading(true);
-    try {
-      const data = await api.auth.login(email, 'Password123!');
-      setUser(data.user);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -68,7 +56,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, quickSwitchUser, refreshUser }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, refreshUser }}>
       {children}
     </AuthContext.Provider>
   );
@@ -81,3 +69,4 @@ export const useAuth = (): AuthContextType => {
   }
   return context;
 };
+

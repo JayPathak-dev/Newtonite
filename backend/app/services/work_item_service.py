@@ -7,18 +7,59 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models.work_item import WorkItem, WorkItemStatus, WorkItemPriority, WorkType, ApprovalStatus
 from app.models.activity import EventType
-from app.models.user import User
+from app.models.user import User, SystemRole
+from app.models.team import Team
+from app.models.team_membership import TeamMembership
 from app.core.exceptions import (
     NotFoundError, ForbiddenError, StaleVersionError,
-    AlreadyClaimedError, IdempotencyConflictError, WorkflowError
+    AlreadyClaimedError, IdempotencyConflictError, WorkflowError,
+    ValidationError, ConflictError
 )
-from app.core.permissions import can_access_work_item, can_update_work_item, can_claim_work_item, can_assign_work_item
+from app.core.permissions import (
+    can_access_work_item, can_update_work_item, can_claim_work_item,
+    can_assign_work_item, can_create_work_item
+)
 from app.services.activity_service import log_event
 from app.services.workflow_service import validate_transition
-from app.services.idempotency_service import check_or_create_idempotency, record_idempotency_result
+from app.services.idempotency_service import (
+    check_or_create_idempotency, record_idempotency_result, validate_idempotency_key
+)
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def validate_assignee_membership(db: Session, assignee_id: Optional[str], team_id: str) -> None:
+    """
+    Validate that assignee exists, is active, and belongs to the team (or is System Admin).
+    Raises ValidationError if any check fails.
+    """
+    if not assignee_id:
+        return
+
+    user = db.query(User).filter(User.id == assignee_id).first()
+    if not user:
+        raise ValidationError("Assignee does not exist")
+    if not user.is_active:
+        raise ValidationError("Cannot assign work to an inactive user")
+
+    team = db.query(Team).filter(Team.id == team_id).first()
+    if not team:
+        raise ValidationError("Target team does not exist")
+    if not team.is_active:
+        raise ValidationError("Target team is not active")
+
+    # Admins have global operational scope across all teams
+    if user.role == SystemRole.ADMIN:
+        return
+
+    membership = db.query(TeamMembership).filter(
+        TeamMembership.user_id == assignee_id,
+        TeamMembership.team_id == team_id,
+    ).first()
+    if not membership:
+        raise ValidationError(f"User '{user.name}' is not a member of team '{team.name}'")
+
 
 
 def _get_next_key(db: Session) -> str:
@@ -53,10 +94,25 @@ def create_work_item(
     idempotency_key: Optional[str] = None,
 ) -> WorkItem:
     """
-    Create a work item with idempotency support.
+    Create a work item with idempotency support and assignee validation.
     All operations (create + activity log + idempotency record) are in a single transaction.
     """
-    # Build fingerprint-relevant data (without idempotency key itself)
+    # 1. Verify creator permission in target team
+    if not can_create_work_item(actor, team_id):
+        raise ForbiddenError("You don't have permission to create work in this team")
+
+    # 2. Verify target team exists and is active
+    team = db.query(Team).filter(Team.id == team_id).first()
+    if not team:
+        raise ValidationError("Target team does not exist")
+    if not team.is_active:
+        raise ValidationError("Target team is not active")
+
+    # 3. Validate assignee membership
+    if assignee_id:
+        validate_assignee_membership(db, assignee_id, team_id)
+
+    # 4. Build fingerprint-relevant data
     request_data = {
         "title": title,
         "team_id": team_id,
@@ -68,18 +124,16 @@ def create_work_item(
         "requires_approval": requires_approval,
     }
 
-    # Check idempotency before doing any work
+    # 5. Check idempotency before doing any work
     if idempotency_key:
-        try:
-            is_duplicate, existing_id = check_or_create_idempotency(
-                db, idempotency_key, actor.id, "create_work_item", request_data
-            )
-            if is_duplicate and existing_id:
-                existing = db.query(WorkItem).filter(WorkItem.id == existing_id).first()
-                if existing:
-                    return existing
-        except IdempotencyConflictError:
-            raise
+        validate_idempotency_key(idempotency_key)
+        is_duplicate, existing_id = check_or_create_idempotency(
+            db, idempotency_key, actor.id, "create_work_item", request_data
+        )
+        if is_duplicate and existing_id:
+            existing = db.query(WorkItem).filter(WorkItem.id == existing_id).first()
+            if existing:
+                return existing
 
     # Generate key atomically
     key = _get_next_key(db)
@@ -105,6 +159,17 @@ def create_work_item(
     db.add(work_item)
     db.flush()  # Get the ID without committing
 
+    # If approval is required, track initial pending approval record
+    if requires_approval:
+        from app.models.approval import ApprovalRecord, ApprovalDecision
+        pending_record = ApprovalRecord(
+            work_item_id=work_item.id,
+            requested_by_id=actor.id,
+            decision=ApprovalDecision.PENDING,
+            requested_at=datetime.now(timezone.utc),
+        )
+        db.add(pending_record)
+
     # Record activity - in same transaction
     log_event(
         db, work_item, actor, EventType.WORK_ITEM_CREATED,
@@ -112,16 +177,18 @@ def create_work_item(
         metadata={"key": key, "priority": priority.value if hasattr(priority, 'value') else priority},
     )
 
-    # Record idempotency result - in same transaction
+    # Record idempotency result using a savepoint to protect session integrity
     if idempotency_key:
         try:
-            record_idempotency_result(
-                db, idempotency_key, actor.id, "create_work_item", request_data, work_item.id
-            )
+            with db.begin_nested():
+                record_idempotency_result(
+                    db, idempotency_key, actor.id, "create_work_item", request_data, work_item.id
+                )
+                db.flush()
         except IntegrityError:
             # Another concurrent request with same key completed first
             db.rollback()
-            # Re-fetch the winning record
+            # Re-fetch the winning record cleanly
             is_duplicate, existing_id = check_or_create_idempotency(
                 db, idempotency_key, actor.id, "create_work_item", request_data
             )
@@ -133,6 +200,7 @@ def create_work_item(
     db.commit()
     db.refresh(work_item)
     return work_item
+
 
 
 def update_work_item(
@@ -199,9 +267,31 @@ def update_work_item(
         })
         update_dict["due_at"] = updates["due_at"]
 
+    if "team_id" in updates and updates["team_id"] != item.team_id:
+        new_team_id = updates["team_id"]
+        team = db.query(Team).filter(Team.id == new_team_id).first()
+        if not team or not team.is_active:
+            raise ValidationError("Target team does not exist or is inactive")
+        if not can_create_work_item(actor, new_team_id):
+            raise ForbiddenError("You don't have permission to move work to this team")
+        target_assignee = updates.get("assignee_id", item.assignee_id)
+        if target_assignee:
+            validate_assignee_membership(db, target_assignee, new_team_id)
+        activity_events.append({
+            "event_type": EventType.TEAM_CHANGED,
+            "field_name": "team_id",
+            "previous_value": item.team_id,
+            "new_value": new_team_id,
+            "summary": f"Moved work item to team {team.name}",
+        })
+        update_dict["team_id"] = new_team_id
+
     if "assignee_id" in updates and updates["assignee_id"] != item.assignee_id:
         if not can_assign_work_item(actor, item):
             raise ForbiddenError("You don't have permission to assign this work item")
+        target_team_id = updates.get("team_id", item.team_id)
+        if updates["assignee_id"]:
+            validate_assignee_membership(db, updates["assignee_id"], target_team_id)
         activity_events.append({
             "event_type": EventType.ASSIGNEE_CHANGED,
             "field_name": "assignee_id",
@@ -335,6 +425,8 @@ def claim_work_item(db: Session, actor: User, work_item_id: str) -> WorkItem:
     if not can_claim_work_item(actor, item):
         raise ForbiddenError("You don't have permission to claim this work item")
 
+    validate_assignee_membership(db, actor.id, item.team_id)
+
     now = datetime.now(timezone.utc)
 
     # Atomic conditional update: only succeeds if assignee is still NULL
@@ -352,11 +444,9 @@ def claim_work_item(db: Session, actor: User, work_item_id: str) -> WorkItem:
 
     if not updated:
         db.rollback()
-        # Re-fetch current state to provide informative error
         current = db.query(WorkItem).filter(WorkItem.id == work_item_id).first()
         if not current or not can_access_work_item(actor, current):
             raise NotFoundError("Work item not found")
-        # Item already assigned
         assignee_name = current.assignee.name if current.assignee else "another user"
         raise AlreadyClaimedError(assignee_name=assignee_name)
 
@@ -387,6 +477,9 @@ def assign_work_item(
     if not can_assign_work_item(actor, item):
         raise ForbiddenError("You don't have permission to assign this work item")
 
+    if assignee_id:
+        validate_assignee_membership(db, assignee_id, item.team_id)
+
     old_assignee_id = item.assignee_id
     now = datetime.now(timezone.utc)
 
@@ -412,7 +505,7 @@ def assign_work_item(
     db.refresh(item)
     log_event(
         db, item, actor, EventType.ASSIGNEE_CHANGED,
-        f"Assignee changed",
+        "Assignee changed",
         field_name="assignee_id",
         previous_value=old_assignee_id,
         new_value=assignee_id,
@@ -430,7 +523,11 @@ def decide_approval(
     decision: str,  # "approved" or "rejected"
     explanation: Optional[str] = None,
 ) -> WorkItem:
-    """Record an approval or rejection for a work item requiring approval."""
+    """
+    Record an approval or rejection for a work item requiring approval.
+    Uses atomic conditional update on pending status to guarantee that competing decisions
+    produce exactly one winner, while losing concurrent requests receive an immediate 409 conflict.
+    """
     from app.models.approval import ApprovalRecord, ApprovalDecision
     from app.core.permissions import can_approve_work_item
 
@@ -439,8 +536,8 @@ def decide_approval(
     if not can_approve_work_item(actor, item):
         raise ForbiddenError("You don't have permission to approve/reject this work item")
 
-    if not item.requires_approval or item.approval_status != ApprovalStatus.PENDING:
-        raise WorkflowError("This work item does not have a pending approval request")
+    if not item.requires_approval:
+        raise WorkflowError("This work item does not require approval")
 
     approval_decision = (
         ApprovalDecision.APPROVED if decision.lower() == "approved" else ApprovalDecision.REJECTED
@@ -450,21 +547,58 @@ def decide_approval(
     )
     now = datetime.now(timezone.utc)
 
-    # Insert approval record
-    record = ApprovalRecord(
-        work_item_id=item.id,
-        requested_by_id=item.created_by_id,
-        decided_by_id=actor.id,
-        decision=approval_decision,
-        explanation=explanation,
-        decided_at=now,
+    # Atomic conditional update: only succeeds if approval_status is still PENDING
+    result = db.execute(
+        update(WorkItem)
+        .where(
+            WorkItem.id == work_item_id,
+            WorkItem.requires_approval.is_(True),
+            WorkItem.approval_status == ApprovalStatus.PENDING,
+        )
+        .values(
+            approval_status=new_approval_status,
+            version=WorkItem.version + 1,
+            updated_at=now,
+        )
+        .returning(WorkItem.version)
     )
-    db.add(record)
+    updated = result.fetchone()
 
-    # Update item approval status & bump version
-    item.approval_status = new_approval_status
-    item.version = item.version + 1
-    item.updated_at = now
+    if not updated:
+        db.rollback()
+        current = db.query(WorkItem).filter(WorkItem.id == work_item_id).first()
+        if not current or not can_access_work_item(actor, current):
+            raise NotFoundError("Work item not found")
+        raise ConflictError(
+            code="ALREADY_DECIDED",
+            message=f"This approval request has already been decided ({current.approval_status.value}).",
+            details={"current_status": current.approval_status.value},
+        )
+
+    # Find pending approval record to update, or create record if none exists
+    pending_record = (
+        db.query(ApprovalRecord)
+        .filter(
+            ApprovalRecord.work_item_id == work_item_id,
+            ApprovalRecord.decision == ApprovalDecision.PENDING,
+        )
+        .first()
+    )
+    if pending_record:
+        pending_record.decision = approval_decision
+        pending_record.decided_by_id = actor.id
+        pending_record.explanation = explanation
+        pending_record.decided_at = now
+    else:
+        record = ApprovalRecord(
+            work_item_id=item.id,
+            requested_by_id=item.created_by_id,
+            decided_by_id=actor.id,
+            decision=approval_decision,
+            explanation=explanation,
+            decided_at=now,
+        )
+        db.add(record)
 
     event_type = (
         EventType.APPROVAL_GRANTED
@@ -476,6 +610,7 @@ def decide_approval(
     if explanation:
         summary += f": {explanation}"
 
+    db.refresh(item)
     log_event(
         db, item, actor, event_type, summary,
         field_name="approval_status",
@@ -487,4 +622,5 @@ def decide_approval(
     db.commit()
     db.refresh(item)
     return item
+
 

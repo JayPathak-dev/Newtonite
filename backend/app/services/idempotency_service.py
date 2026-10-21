@@ -4,13 +4,22 @@ import json
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models.idempotency import IdempotencyRecord
-from app.core.exceptions import IdempotencyConflictError
+from app.core.exceptions import IdempotencyConflictError, ValidationError
+
+
+def validate_idempotency_key(idempotency_key: str) -> None:
+    """Validate that idempotency key is well-formed."""
+    if not idempotency_key or not idempotency_key.strip():
+        raise ValidationError("Idempotency key cannot be empty")
+    if len(idempotency_key) > 255:
+        raise ValidationError("Idempotency key must not exceed 255 characters")
 
 
 def _fingerprint(data: dict) -> str:
     """Compute a canonical SHA-256 fingerprint of a request dict."""
     canonical = json.dumps(data, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
+
 
 
 def check_or_create_idempotency(

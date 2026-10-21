@@ -1,129 +1,216 @@
-# Engineering Decisions & Architecture Trade-offs: Newtonite Ops
+# Engineering Decisions & Architecture Specification: Newtonite Ops
 
-This document articulates the architecture, data modeling, concurrency designs, and trade-offs implemented in **Newtonite Ops**, built for the Newtonite Software Engineering Assessment.
-
----
-
-## 1. Architectural Philosophy: The Modular Monolith
-
-Newtonite Ops coordinates mission-critical operational work (payment investigations, incident triage, approval authorizations, customer escalations).
-
-### Decision
-We rejected microservices, distributed queues (Kafka/Celery), and external caching layers (Redis) in favor of a **Modular Monolith backed by PostgreSQL as the authoritative single source of truth**.
-
-### Rationale
-- **Atomic Correctness**: Operational work requires strict transactional invariants. In a distributed microservices setup, recording an activity log, updating a work item, verifying optimistic concurrency, and persisting idempotency fingerprints requires complex 2-phase commits or saga orchestrators. In PostgreSQL, all four operations execute inside a single ACID database transaction.
-- **Cognitive & Operational Simplicity**: The entire application can be spun up in 60 seconds with `docker compose up -d` and single-process backend/frontend servers, with zero distributed synchronization latency or split-brain risks.
-- **Domain Boundaries**: Clean separation between routes, schemas, services, and models ensures that if a service (e.g., audit logging or notifications) ever requires isolation, extraction is mechanical rather than architectural.
+This document provides a comprehensive technical review and rationale for the architectural patterns, database concurrency mechanisms, security controls, and trade-offs implemented in **Newtonite Ops**.
 
 ---
 
-## 2. Core Correctness Feature 1: Atomic Claiming & Race Condition Safety
+## 1. Modular Monolith and PostgreSQL as the Source of Truth
 
-### Problem
-When an unassigned item appears in an operations queue, multiple agents simultaneously click "Claim Item" or "Assign to Me". A naive `SELECT -> UPDATE` sequence allows race conditions where two users both believe they won, overwriting each other and emitting duplicate activity events.
+### The Problem
+Newtonite Ops coordinates mission-critical operational work (payment investigations, incident triage, approval authorizations, customer escalations). Operations workflows require strict transactional invariants across state changes, activity logs, approval status, and idempotency guarantees.
 
-### Implemented Solution
-We utilize a conditional atomic update directly at the database engine level:
+### The Approach
+A structured, modular monolith built with FastAPI, SQLAlchemy 2.0, and PostgreSQL 16. Services are organized with explicit separation of concerns:
+- **API routers** handle HTTP serialization, query params, cookies, and status codes.
+- **Service layer** (`work_item_service`, `activity_service`, `idempotency_service`, `dashboard_service`) encapsulates domain business rules and database transaction boundaries.
+- **Permissions module** (`permissions.py`) provides centralized role-based access control (RBAC).
+- **PostgreSQL 16** serves as the single transactional source of truth, enforcing foreign keys, sequences, row-level locks, and unique constraints.
 
-```sql
-UPDATE work_items
-SET assignee_id = :actor_id,
-    version = work_items.version + 1,
-    updated_at = :now
-WHERE id = :work_item_id
-  AND assignee_id IS NULL
-RETURNING version, assignee_id;
-```
+### Why It Was Selected
+- **ACID Invariants**: Operations requiring multi-table updates (e.g., status transition + activity log + version increment + idempotency record) commit or roll back in a single atomic database transaction.
+- **Operational Simplicity**: Clean local setup with `docker-compose.yml` and unified testing without network partition risks.
+- **Mechanical Service Extraction**: Clean internal service boundaries permit future extraction of specific modules (such as notifications or audit logging) without rewriting domain contracts.
 
-### Invariants Guaranteed
-1. **Row Count Verification**: If another worker's transaction commits first, `assignee_id IS NULL` evaluates to `FALSE`. The database updates 0 rows and returns empty.
-2. **Deterministic Conflict Handling**: The server rolls back the transaction, inspects the current owner, and returns `HTTP 409 Conflict` with error code `ALREADY_CLAIMED` and the winning user's name.
-3. **No Phantom Activity**: The `WORK_ITEM_CLAIMED` activity log is inserted in the *exact same transaction* as the successful row update. If the claim fails, the activity log rolls back atomically.
-4. **Verified by Concurrency Tests**: Tested under 10 concurrent threads in `tests/test_concurrency_claiming.py`, proving that exactly 1 worker succeeds and 9 receive HTTP 409.
+### Alternatives Considered
+- **Microservices Architecture**: Rejected due to distributed transaction complexities (2-phase commits/saga patterns) and split-brain risks under network partitions.
+- **Document Store (MongoDB)**: Rejected because multi-document ACID transactions and foreign key integrity across teams, users, and audit logs are second-class compared to PostgreSQL.
+
+### Trade-offs & Remaining Risks
+- Scaling writes requires vertical scaling or table partitioning rather than sharding.
+- All modules share database connection pools; unbounded queries could impact API response times without query limits.
 
 ---
 
-## 3. Core Correctness Feature 2: Optimistic Concurrency Control (OCC)
+## 2. Authentication, HttpOnly Cookies, and CSRF Protection
 
-### Problem
-In operational work, stale overwrites ("lost updates") cause severe bugs: Employee A opens version 1 of a payment issue to add investigation notes. Simultaneously, Employee B escalates the priority to CRITICAL. When Employee A submits, their form submits based on version 1, potentially reverting Employee B's priority change.
+### The Problem
+Browser applications storing access tokens in `localStorage` or `sessionStorage` are vulnerable to token theft via Cross-Site Scripting (XSS). Conversely, pure cookie-based authentication requires protection against Cross-Site Request Forgery (CSRF). Inconsistent authentication architectures (where both localStorage and cookies compete) cause session desynchronization.
 
-### Implemented Solution
-Every `work_item` row maintains an integer `version` column (starting at 1). Every state-changing API request (`PATCH`, `/transition`, `/assign`) requires the client to supply the `version` they read:
+### The Approach
+- **Pure HttpOnly Cookie Authentication**:
+  Upon successful login, the server sets an `access_token` cookie with `HttpOnly=True`, `SameSite="lax"`, `path="/"`, and `secure=True` in production environments. Tokens are never exposed to client-side JavaScript.
+- **Double-Submit CSRF Protection**:
+  On login or session fetch, the server sets a readable `csrf_token` cookie (`HttpOnly=False`, `SameSite="lax"`). For state-changing operations (`POST`, `PATCH`, `PUT`, `DELETE`), the client API layer extracts this token and transmits it via the `X-CSRF-Token` HTTP header.
+- **FastAPI CSRF & Origin Middleware**:
+  An HTTP middleware checks state-changing requests when an auth cookie is present. It verifies:
+  1. The `Origin` header matches configured CORS origins.
+  2. The `X-CSRF-Token` header matches the `csrf_token` cookie using constant-time comparison (`hmac.compare_digest`).
+  Requests failing validation receive `HTTP 403 Forbidden` (`CSRF_ERROR`).
+- **Login Abuse Protection**:
+  An in-memory sliding-window rate limiter tracks login attempts per client IP address. Exceeding 15 attempts in a 60-second window yields `HTTP 429 Too Many Requests` (`RATE_LIMIT_EXCEEDED`).
+- **Resource Disclosure Policy**:
+  Unauthorized cross-team resource lookups return `HTTP 404 Not Found` rather than `HTTP 403 Forbidden`, preventing resource enumeration attacks.
 
-```sql
-UPDATE work_items
-SET title = :new_title,
-    priority = :new_priority,
-    version = work_items.version + 1,
-    updated_at = :now
-WHERE id = :work_item_id
-  AND version = :expected_version
-RETURNING version;
-```
+### Why It Was Selected
+This adheres to OWASP guidelines for secure session management in single-page applications without requiring heavyweight session backends like Redis.
 
-### Invariants Guaranteed
-1. If the database row version was already bumped by another transaction, zero rows match the condition.
-2. The server rolls back, fetches the fresh current version, and responds with `HTTP 409 Conflict`:
-   ```json
-   {
-     "error": {
-       "code": "STALE_VERSION",
-       "message": "This work item has changed since you opened it. Please refresh and try again.",
-       "details": { "current_version": 4 }
-     }
-   }
+### Alternatives Considered
+- **Synchronizer Token Pattern with Server-Side Session Store**: Requires shared cache infrastructure (Redis) to store server-side CSRF tokens, adding operational overhead for placement assessment.
+- **Bearer Tokens in LocalStorage**: Vulnerable to XSS token exfiltration; explicitly prohibited.
+
+### Trade-offs & Remaining Risks
+- The in-memory login rate limiter is node-local; in a multi-instance production deployment behind a load balancer, an external Redis rate limiter would be required.
+
+---
+
+## 3. Atomic Assignment and Approval Decisions (Race-Condition Safety)
+
+### The Problem
+When work items are unassigned, or when high-value items require approval signoff, two concurrent requests may read the item in `PENDING` state and attempt conflicting updates. A naive `SELECT` followed by an `UPDATE` allows both requests to pass validation, silently overwriting each other and emitting duplicate activity events.
+
+### The Approach
+1. **Atomic Conditional Updates**:
+   For approval decisions:
+   ```sql
+   UPDATE work_items
+   SET approval_status = :new_status,
+       version = work_items.version + 1,
+       updated_at = :now
+   WHERE id = :work_item_id
+     AND requires_approval IS TRUE
+     AND approval_status = 'pending'
+   RETURNING version;
    ```
-3. **Frontend Recovery Banner**: When the React UI encounters a 409, it does not discard the user's edits. It presents a `ConflictBanner` explaining that another team member updated the item, with a 1-click `Reload Latest Version` button.
+   For work item claiming:
+   ```sql
+   UPDATE work_items
+   SET assignee_id = :actor_id,
+       version = work_items.version + 1,
+       updated_at = :now
+   WHERE id = :work_item_id
+     AND assignee_id IS NULL
+   RETURNING version, assignee_id;
+   ```
+2. **Row Count Verification**:
+   If another transaction commits first, zero rows match the condition (`updated is None`).
+3. **Transaction Rollback & Conflict Resolution**:
+   When zero rows are updated, the service immediately rolls back the session, re-queries the current state to check permissions, and returns `HTTP 409 Conflict` (`ALREADY_DECIDED` or `ALREADY_CLAIMED`).
+4. **Single Transaction Boundary**:
+   The work item state update, `ApprovalRecord` insertion, and `ActivityLog` creation are all committed in the exact same transaction. If any part fails, all changes roll back atomically.
+
+### Why It Was Selected
+Database-level conditional updates eliminate race conditions without requiring table-level locks or distributed mutexes.
+
+### Alternatives Considered
+- **Pessimistic Locking (`SELECT FOR UPDATE`)**: Effective, but holds locks across network roundtrips and increases the risk of deadlocks under high concurrency.
+- **Application-Level Mutex (e.g. `threading.Lock`)**: Ineffective across multi-process or multi-worker deployments.
+
+### Trade-offs & Remaining Risks
+- The losing client must handle the 409 Conflict gracefully in the UI.
 
 ---
 
-## 4. Core Correctness Feature 3: Server-Enforced Idempotent Creation
+## 4. Optimistic Concurrency Control (OCC)
 
-### Problem
-Network hiccups, proxy timeouts, or double-clicks on "Create Work Item" can cause clients to retry creation requests. Without idempotency, duplicate tickets (and duplicate sequence IDs like NEW-10 and NEW-11) flood the queue.
+### The Problem
+In multi-user collaborative operations, stale overwrites ("lost updates") cause data corruption. If User A opens version 1 of a ticket, and User B edits it to version 2, User A's subsequent submission would silently overwrite User B's changes unless versioning is checked.
 
-### Implemented Solution
-Clients generate a client-side UUID (`idempotency_key`) for each logical creation flow. The server records this in a dedicated `idempotency_records` table:
+### The Approach
+- Every `work_items` record contains an integer `version` column starting at 1.
+- All mutating requests (`PATCH /work-items/{id}`, `POST /transition`, `POST /assign`) require the client to supply the expected `version`.
+- Updates execute conditionally:
+  ```sql
+  UPDATE work_items
+  SET title = :title,
+      version = work_items.version + 1,
+      updated_at = :now
+  WHERE id = :work_item_id AND version = :expected_version
+  RETURNING version;
+  ```
+- If 0 rows match, the transaction rolls back and returns `HTTP 409 Conflict` (`STALE_VERSION`) including the current version in details.
+- The frontend preserves user edits and displays a `ConflictBanner` offering a reload action.
 
-```sql
-CREATE TABLE idempotency_records (
-    id UUID PRIMARY KEY,
-    idempotency_key VARCHAR(255) NOT NULL,
-    actor_id VARCHAR(255) NOT NULL,
-    operation VARCHAR(100) NOT NULL,
-    request_fingerprint VARCHAR(64) NOT NULL,
-    result_resource_id VARCHAR(255),
-    created_at TIMESTAMPTZ NOT NULL,
-    CONSTRAINT uq_idempotency UNIQUE (idempotency_key, actor_id, operation)
-);
-```
+### Why It Was Selected
+OCC is the industry standard for collaborative web applications with low contention, avoiding unnecessary locking while guaranteeing zero lost updates.
 
-### Invariants Guaranteed
-1. **Database Uniqueness**: Uniqueness is enforced by a database constraint (`uq_idempotency`), preventing in-memory cache race conditions.
-2. **Cryptographic Fingerprint Match**: The request payload is canonicalized and hashed using SHA-256 (`request_fingerprint`). If a retry arrives with the exact same key and matching fingerprint, the original created resource is returned with `HTTP 200/201`.
-3. **Key Replay Protection**: If a client attempts to reuse an existing idempotency key with a *different* payload, the server rejects it with `HTTP 409 Conflict` (`IDEMPOTENCY_CONFLICT`).
-
----
-
-## 5. Security & Authorization Model
-
-### Multi-Tenant & Team Isolation
-- **System Roles**: `ADMIN`, `USER`, `VIEWER`.
-- **Team Roles**: `MEMBER`, `LEAD`, `APPROVER`.
-- **Non-Enumeration Policy**: If an authenticated user from Customer Operations tries to read or modify a Payments team work item by its UUID, the API returns `HTTP 404 Not Found` rather than `403 Forbidden`, preventing resource enumeration attacks.
-- **Viewer Restrictions**: `VIEWER` accounts can read items and search operational dashboards, but all state mutations (`POST /work-items`, `PATCH`, `claim`, `assign`, `comments`, `approval`) are rejected with `HTTP 403 Forbidden`.
-
-### Password Hashing & JWT Authentication
-- **Argon2id**: Passwords hashed using standard Argon2id parameters (`time_cost=2`, `memory_cost=65536`, `parallelism=2`). Plaintext passwords are never persisted.
-- **Dual Session Mechanism**: Supports both HttpOnly SameSite cookies for browser security against XSS, and `Authorization: Bearer <token>` for automated API testing and CLI access.
+### Alternatives Considered
+- **Last-Write-Wins (LWW)**: Unacceptable for operational work; leads to silent data loss.
+- **WebSocket Real-Time Locks**: Adds operational fragility, stateful connection handling, and reconnect synchronization complexity.
 
 ---
 
-## 6. Key Sequences: Human-Readable Keys
+## 5. Server-Enforced Idempotent Creation with Nested Savepoints
 
-Instead of exposing opaque UUIDs like `f47ac10b-58cc-4372-a567-0e02b2c3d479` in daily communications, items use human-friendly keys like `NEW-1`, `NEW-2`:
-- Implemented using a dedicated PostgreSQL sequence (`work_item_key_seq`).
-- Evaluated atomically via `SELECT nextval('work_item_key_seq')`.
-- Safe under high concurrent creation load with zero key collisions.
+### The Problem
+Network timeouts or impatient double-clicks can cause clients to submit creation requests multiple times. Without idempotency, duplicate tickets and sequence keys are generated. Furthermore, in SQLAlchemy, if a concurrent request triggers an `IntegrityError` during flush/commit, a naive rollback can corrupt or invalidate the session.
+
+### The Approach
+1. **Client Key Scoping**:
+   Clients supply an `Idempotency-Key` or `idempotency_key` payload attribute.
+2. **Deterministic Payload Fingerprinting**:
+   The server computes a canonical SHA-256 hash of the normalized request payload.
+3. **Database Uniqueness Constraint**:
+   Persisted in `idempotency_records` with `UniqueConstraint("idempotency_key", "actor_id", "operation")`.
+4. **Nested Savepoints (`db.begin_nested()`)**:
+   When recording the idempotency record, the service wraps the flush in a savepoint:
+   ```python
+   try:
+       with db.begin_nested():
+           record_idempotency_result(db, idempotency_key, actor.id, "create_work_item", request_data, item.id)
+           db.flush()
+   except IntegrityError:
+       db.rollback()
+       # Re-query winning idempotency record and return original created item
+   ```
+   If a duplicate request commits concurrently, the savepoint catches the constraint violation without invalidating the outer SQLAlchemy session.
+5. **Replay Validation**:
+   - Matching fingerprint: Returns original created resource (`HTTP 200/201`).
+   - Different fingerprint: Rejects with `HTTP 409 Conflict` (`IDEMPOTENCY_CONFLICT`).
+
+---
+
+## 6. Transactionally Consistent Activity History (Audit Trail)
+
+### The Problem
+Audit trails are useless if they become desynchronized from the actual database state (e.g. an activity record exists for an operation that failed to persist, or an update succeeded but the audit log failed).
+
+### The Approach
+- **Append-Only Semantics**:
+  Activity logs are strictly append-only records with server-generated timestamps (`TIMESTAMPTZ`) and foreign keys to `work_items` and `users`.
+- **Atomic Transaction Enclosure**:
+  Every business mutation commits its corresponding activity event within the same database transaction.
+- **Server-Derived Context**:
+  Actor IDs, previous values, and new values are extracted directly from authenticated server session state and verified database models, never trusted from client payloads.
+
+---
+
+## 7. Search, Pagination, Indexing, and Performance
+
+### The Problem
+In-memory filtering and unpaginated database queries degrade linearly as queues grow, leading to N+1 query bottlenecks and excessive database CPU utilization.
+
+### The Approach
+- **Deterministic Server-Side Pagination**:
+  Pagination (`offset`, `limit`) and sorting validate against `VALID_SORT_FIELDS` with deterministic secondary sorting by `id ASC`.
+- **Database Indexing**:
+  B-Tree indexes applied to:
+  - `work_items (team_id, status)` for team queue filtering.
+  - `work_items (assignee_id, status)` for "My Work" queries.
+  - `work_items (due_at)` for overdue calculations.
+  - `work_items (created_at)` and `work_items (updated_at)` for timeline ordering.
+  - Foreign keys: `team_memberships.user_id`, `team_memberships.team_id`, `comments.work_item_id`.
+  - Unique constraint on `(idempotency_key, actor_id, operation)`.
+- **Database Aggregates for Dashboard**:
+  Dashboard summaries execute SQL aggregates (`COUNT`, `GROUP BY`) rather than fetching full ORM object graphs into application memory.
+- **PostgreSQL Sequences for Human-Readable Keys**:
+  Human-friendly keys (`OPS-1`, `OPS-2`) are issued via an atomic database sequence (`work_item_key_seq`), eliminating collision races.
+
+---
+
+## 8. Deliberate Scope Limitations
+
+To maintain code clarity and project focus within the assessment constraints:
+1. **No External Message Broker**: Background scheduling and async tasks use standard FastAPI lifecycle patterns rather than Celery or RabbitMQ.
+2. **In-Memory Rate Limiting**: The sliding-window rate limiter is in-memory rather than Redis-backed.
+3. **No Distributed File Storage**: File attachments and binary media are modeled as external links rather than integrating S3/GCS.
+4. **Focused Team Roles**: Roles are modeled as System Roles (`ADMIN`, `USER`, `VIEWER`) and Team Roles (`MEMBER`, `LEAD`, `APPROVER`) rather than arbitrary dynamic permission graphs.
